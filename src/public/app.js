@@ -9,7 +9,8 @@
   livekitLoadingPromise: null,
   mode: "FULL",
   audioStatsTimer: null,
-  audioContext: null
+  audioContext: null,
+  avatarSpeaking: false
 };
 
 const els = {
@@ -300,6 +301,15 @@ async function connectLivekit(info) {
       } catch {
         parsed = text;
       }
+      const dataType = parsed?.type || parsed?.event_type;
+      if (dataType === "avatar_start_talking") {
+        state.avatarSpeaking = true;
+        stopRecognition();
+      }
+      if (dataType === "avatar_stop_talking") {
+        state.avatarSpeaking = false;
+        startRecognition();
+      }
       log("LiveKit DataReceived", {
         topic,
         kind,
@@ -334,11 +344,13 @@ async function connectLivekit(info) {
         }
         const identity = participant?.identity || "";
         const identityLower = identity.toLowerCase();
-        const allowAudio =
-          !identity ||
-          identityLower.includes("heygen") ||
-          identityLower.includes("liveavatar") ||
-          identityLower.includes("agent");
+        const isAgent = identityLower.includes("agent");
+        const isAvatar = identityLower.includes("heygen") || identityLower.includes("liveavatar");
+        if (state.useGpt && isAgent) {
+          log("Skip agent audio when GPT is on", { participant: identity });
+          return;
+        }
+        const allowAudio = !identity || isAvatar || isAgent;
         if (!allowAudio) {
           log("Skip non-avatar audio", { participant: identity });
           return;
@@ -446,7 +458,7 @@ function startRecognition() {
 
   recognition.onresult = async (event) => {
     const transcript = event.results?.[event.results.length - 1]?.[0]?.transcript;
-    if (!transcript || state.busy) return;
+    if (!transcript || state.busy || state.avatarSpeaking) return;
 
     state.busy = true;
     log("音声認識", { text: transcript });
