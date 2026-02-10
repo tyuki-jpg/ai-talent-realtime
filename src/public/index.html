@@ -24,6 +24,13 @@
           <span>Avatar ID</span>
           <input id="avatarId" type="text" placeholder="例: liveavatar_avatar_id" />
         </label>
+        <label class="field">
+          <span>Mode</span>
+          <select id="modeSelect">
+            <option value="FULL">FULL (LiveAvatar Voice)</option>
+            <option value="CUSTOM">CUSTOM (Custom TTS)</option>
+          </select>
+        </label>
         <div class="inline-meta">
           <button id="fetchPublicBtn" class="ghost small" type="button">プリセット取得</button>
         </div>
@@ -50,6 +57,10 @@
           <select id="voiceSelect">
             <option value="">未取得</option>
           </select>
+        </label>
+        <label class="field">
+          <span>Custom Voice ID</span>
+          <input id="ttsVoiceId" type="text" placeholder="custom_tts_voice_id" />
         </label>
         <div class="inline-meta">
           <button id="fetchContextsBtn" class="ghost small" type="button">Context取得</button>

@@ -6,11 +6,15 @@
   recognition: null,
   busy: false,
   useGpt: true,
-  livekitLoadingPromise: null
+  livekitLoadingPromise: null,
+  mode: "FULL",
+  audioStatsTimer: null,
+  audioContext: null
 };
 
 const els = {
   avatarId: document.getElementById("avatarId"),
+  modeSelect: document.getElementById("modeSelect"),
   connectBtn: document.getElementById("connectBtn"),
   stopBtn: document.getElementById("stopBtn"),
   fetchPublicBtn: document.getElementById("fetchPublicBtn"),
@@ -19,6 +23,7 @@ const els = {
   userSelect: document.getElementById("userSelect"),
   fetchVoicesBtn: document.getElementById("fetchVoicesBtn"),
   voiceSelect: document.getElementById("voiceSelect"),
+  ttsVoiceId: document.getElementById("ttsVoiceId"),
   fetchContextsBtn: document.getElementById("fetchContextsBtn"),
   contextSelect: document.getElementById("contextSelect"),
   personaSelect: document.getElementById("personaSelect"),
@@ -36,6 +41,22 @@ function log(message, data) {
   const time = new Date().toLocaleTimeString();
   const payload = data ? `\n${JSON.stringify(data, null, 2)}` : "";
   els.logBox.textContent = `[${time}] ${message}${payload}\n` + els.logBox.textContent;
+}
+
+async function logOutputDevices(context) {
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    log("OutputDevices: enumerateDevices unsupported");
+    return;
+  }
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const outputs = devices
+      .filter((device) => device.kind === "audiooutput")
+      .map((device) => ({ deviceId: device.deviceId, label: device.label || "(no label)" }));
+    log("OutputDevices", { context, outputs });
+  } catch (error) {
+    log("OutputDevices error", { message: error.message });
+  }
 }
 
 async function api(path, method = "GET", body) {
@@ -178,6 +199,17 @@ function setConnectedUi(connected) {
   els.stopBtn.disabled = !connected;
 }
 
+function updateModeUi() {
+  const mode = els.modeSelect?.value || "FULL";
+  state.mode = mode;
+  const isCustom = mode !== "FULL";
+  els.voiceSelect.disabled = isCustom;
+  els.fetchVoicesBtn.disabled = isCustom;
+  els.contextSelect.disabled = isCustom;
+  els.fetchContextsBtn.disabled = isCustom;
+  els.ttsVoiceId.disabled = !isCustom;
+}
+
 function resetAvatarContainer() {
   els.avatarContainer.innerHTML = "<div class=\"avatar-placeholder\">LiveKit接続待ち</div>";
 }
@@ -255,6 +287,27 @@ async function connectLivekit(info) {
     const room = new window.LiveKit.Room();
     state.livekitRoom = room;
 
+    room.on(window.LiveKit.RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+      let text = "";
+      try {
+        text = new TextDecoder().decode(payload);
+      } catch {
+        text = String(payload);
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = text;
+      }
+      log("LiveKit DataReceived", {
+        topic,
+        kind,
+        participant: participant?.identity,
+        data: parsed
+      });
+    });
+
     room.on(window.LiveKit.RoomEvent.TrackSubscribed, (track, publication, participant) => {
       const isLocal = participant?.isLocal ?? false;
       log("LiveKit TrackSubscribed", {
@@ -280,7 +333,13 @@ async function connectLivekit(info) {
           return;
         }
         const identity = participant?.identity || "";
-        if (identity && !identity.toLowerCase().includes("heygen")) {
+        const identityLower = identity.toLowerCase();
+        const allowAudio =
+          !identity ||
+          identityLower.includes("heygen") ||
+          identityLower.includes("liveavatar") ||
+          identityLower.includes("agent");
+        if (!allowAudio) {
           log("Skip non-avatar audio", { participant: identity });
           return;
         }
@@ -290,6 +349,12 @@ async function connectLivekit(info) {
         audio.muted = false;
         audio.volume = 1;
         els.avatarContainer.appendChild(audio);
+        if (typeof audio.setSinkId === "function") {
+          log("Audio sinkId", { sinkId: audio.sinkId || "default" });
+        } else {
+          log("Audio sinkId unsupported");
+        }
+        logOutputDevices("audio-attached");
         const playResult = audio.play();
         if (playResult && typeof playResult.then === "function") {
           playResult.then(
@@ -302,6 +367,10 @@ async function connectLivekit(info) {
         audio.onplay = () => log("Audio onplay");
         audio.onpause = () => log("Audio onpause");
         audio.onended = () => log("Audio ended");
+        if (track.mediaStreamTrack) {
+          track.mediaStreamTrack.onmute = () => log("Audio mediaStreamTrack muted");
+          track.mediaStreamTrack.onunmute = () => log("Audio mediaStreamTrack unmuted");
+        }
         if (track.on && window.LiveKit?.TrackEvent) {
           track.on(window.LiveKit.TrackEvent.Muted, () => {
             log("Audio track muted");
@@ -355,6 +424,13 @@ function stopKeepalive() {
   }
 }
 
+function stopAudioStats() {
+  if (state.audioStatsTimer) {
+    clearInterval(state.audioStatsTimer);
+    state.audioStatsTimer = null;
+  }
+}
+
 function startRecognition() {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) {
@@ -382,9 +458,9 @@ function startRecognition() {
           persona_key: state.personaKey
         });
         log("GPT応答", reply.data);
-        await sendAgentText(reply.data.text);
+        await sendAvatarText(reply.data.text);
       } else {
-        await sendAgentText(transcript);
+        await sendAvatarText(transcript);
       }
     } catch (error) {
       log("音声フロー失敗", { message: error.message, detail: error.detail });
@@ -409,6 +485,65 @@ function stopRecognition() {
   }
 }
 
+async function logAudioStats(room) {
+  if (!room) return;
+  const participants = room.remoteParticipants ? Array.from(room.remoteParticipants.values()) : [];
+  if (participants.length === 0) {
+    log("AudioStats: remote participants not found");
+    return;
+  }
+
+  for (const participant of participants) {
+    const publications = participant.audioTrackPublications
+      ? Array.from(participant.audioTrackPublications.values())
+      : [];
+    if (publications.length === 0) {
+      log("AudioStats: no audio publications", { participant: participant.identity });
+      continue;
+    }
+    for (const pub of publications) {
+      const track = pub?.track;
+      if (!track) {
+        log("AudioStats: track missing", {
+          participant: participant.identity,
+          trackSid: pub.trackSid,
+          muted: pub.isMuted,
+          subscribed: pub.isSubscribed
+        });
+        continue;
+      }
+      if (typeof track.getStats !== "function") {
+        log("AudioStats: getStats unavailable", {
+          participant: participant.identity,
+          trackSid: pub.trackSid
+        });
+        continue;
+      }
+      try {
+        const stats = await track.getStats();
+        let inboundBytes = 0;
+        let packets = 0;
+        stats.forEach((report) => {
+          if (report.type === "inbound-rtp" && (report.kind === "audio" || report.mediaType === "audio")) {
+            inboundBytes += report.bytesReceived || 0;
+            packets += report.packetsReceived || 0;
+          }
+        });
+        log("AudioStats", {
+          participant: participant.identity,
+          trackSid: pub.trackSid,
+          muted: pub.isMuted,
+          subscribed: pub.isSubscribed,
+          bytesReceived: inboundBytes,
+          packetsReceived: packets
+        });
+      } catch (error) {
+        log("AudioStats error", { participant: participant.identity, message: error.message });
+      }
+    }
+  }
+}
+
 async function handleConnect() {
   const avatarId = els.avatarId.value.trim();
   if (!avatarId) {
@@ -416,9 +551,10 @@ async function handleConnect() {
     return;
   }
 
+  const mode = state.mode || "FULL";
   const voiceId = els.voiceSelect.value;
   const contextId = els.contextSelect.value;
-  if (!voiceId || !contextId) {
+  if (mode === "FULL" && (!voiceId || !contextId)) {
     log("voice_id と context_id を選択してください");
     return;
   }
@@ -429,7 +565,7 @@ async function handleConnect() {
       avatar_id: avatarId,
       voice_id: voiceId,
       context_id: contextId,
-      mode: "FULL"
+      mode
     });
     log("LiveAvatar session作成", response.data);
 
@@ -447,6 +583,10 @@ async function handleConnect() {
     const livekitInfo = extractLivekitInfo(response.data);
     await connectLivekit(livekitInfo);
     startRecognition();
+    stopAudioStats();
+    state.audioStatsTimer = setInterval(() => {
+      logAudioStats(state.livekitRoom);
+    }, 5000);
   } catch (error) {
     setConnectionStatus("接続失敗");
     log("接続失敗", { message: error.message, detail: error.detail });
@@ -456,6 +596,7 @@ async function handleConnect() {
 async function handleStop() {
   stopKeepalive();
   stopRecognition();
+  stopAudioStats();
 
   if (state.livekitRoom) {
     state.livekitRoom.disconnect();
@@ -503,9 +644,9 @@ async function handleManualSend() {
         persona_key: state.personaKey
       });
       log("GPT応答", reply.data);
-      await sendAgentText(reply.data.text);
+      await sendAvatarText(reply.data.text);
     } else {
-      await sendAgentText(text);
+      await sendAvatarText(text);
     }
   } catch (error) {
     log("手入力フロー失敗", { message: error.message, detail: error.detail });
@@ -534,10 +675,88 @@ async function sendAgentText(text) {
       reliable: true,
       topic: "agent-control"
     });
-    log("LiveAvatar発話イベント送信", { text });
+    log("LiveAvatar発話イベント送信", { text, topic: "agent-control" });
   } catch (error) {
     log("LiveAvatar発話イベント送信失敗", { message: error.message });
   }
+}
+
+async function sendCustomAudio(text) {
+  if (!state.sessionId) {
+    log("session_id未設定のため送信しませんでした");
+    return;
+  }
+
+  try {
+    const voiceId = els.ttsVoiceId.value.trim();
+    const response = await api("/liveavatar/speak", "POST", {
+      session_id: state.sessionId,
+      text,
+      tts_voice_id: voiceId || undefined
+    });
+    log("Custom TTS送信", { text });
+    const audioBase64 = response?.data?.audio_base64;
+    const sampleRate = response?.data?.sample_rate_hz || 24000;
+    const format = response?.data?.audio_format || "pcm_s16le";
+    if (audioBase64) {
+      playPcm16leBase64(audioBase64, sampleRate, format);
+    }
+  } catch (error) {
+    log("Custom TTS送信失敗", { message: error.message, detail: error.detail });
+  }
+}
+
+function base64ToArrayBuffer(base64) {
+  const binary = atob(base64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+function playPcm16leBase64(base64, sampleRate, format) {
+  if (format !== "pcm_s16le") {
+    log("Custom audio format unsupported for local playback", { format });
+    return;
+  }
+  try {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) {
+      log("AudioContext unsupported");
+      return;
+    }
+    if (!state.audioContext) {
+      state.audioContext = new AudioContext({ sampleRate: sampleRate || 24000 });
+    }
+    const ctx = state.audioContext;
+    if (ctx.state === "suspended") {
+      ctx.resume();
+    }
+    const buffer = base64ToArrayBuffer(base64);
+    const int16 = new Int16Array(buffer);
+    const audioBuffer = ctx.createBuffer(1, int16.length, sampleRate || 24000);
+    const channel = audioBuffer.getChannelData(0);
+    for (let i = 0; i < int16.length; i += 1) {
+      channel[i] = int16[i] / 32768;
+    }
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+    source.start();
+    log("Custom audio local playback", { sampleRate: sampleRate || 24000, frames: int16.length });
+  } catch (error) {
+    log("Custom audio playback failed", { message: error.message });
+  }
+}
+
+async function sendAvatarText(text) {
+  if (state.mode === "FULL") {
+    await sendAgentText(text);
+    return;
+  }
+  await sendCustomAudio(text);
 }
 
 async function init() {
@@ -553,6 +772,12 @@ async function init() {
   if (els.useGptToggle) {
     state.useGpt = Boolean(els.useGptToggle.checked);
   }
+
+  if (els.modeSelect) {
+    updateModeUi();
+  }
+
+  logOutputDevices("init");
 
   try {
     const response = await api("/persona");
@@ -587,6 +812,10 @@ els.sendBtn.addEventListener("click", handleManualSend);
 els.useGptToggle.addEventListener("change", () => {
   state.useGpt = Boolean(els.useGptToggle.checked);
   log("GPT利用切替", { enabled: state.useGpt });
+});
+els.modeSelect?.addEventListener("change", () => {
+  updateModeUi();
+  log("Mode切替", { mode: state.mode });
 });
 
 init();

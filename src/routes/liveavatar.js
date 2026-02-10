@@ -9,10 +9,13 @@ import {
   listVoices,
   listContexts
 } from "../services/liveavatarClient.js";
+import { synthesizeSpeech } from "../services/ttsClient.js";
+import { sendAudioToLiveavatar, closeWs } from "../services/liveavatarWsClient.js";
 
 const router = Router();
 const baseUrl = process.env.LIVEAVATAR_BASE_URL || "https://api.liveavatar.com/v1";
 const sessionTokens = new Map();
+const sessionMeta = new Map();
 
 function handleError(res, error, fallbackMessage) {
   console.error(error);
@@ -23,6 +26,33 @@ function handleError(res, error, fallbackMessage) {
       detail: error?.detail || error?.message || "Unknown error"
     }
   });
+}
+
+function extractWsUrl(payload) {
+  const candidates = [payload, payload?.data, payload?.start, payload?.start?.data];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const wsUrl =
+      candidate.ws_url ||
+      candidate.websocket_url ||
+      candidate.wsUrl ||
+      candidate.websocketUrl ||
+      candidate.livekit_ws_url;
+    if (wsUrl) return wsUrl;
+  }
+  return null;
+}
+
+function getLivekitConfigFromEnv() {
+  const url = process.env.LIVEAVATAR_CUSTOM_LIVEKIT_URL;
+  const room = process.env.LIVEAVATAR_CUSTOM_LIVEKIT_ROOM;
+  const token = process.env.LIVEAVATAR_CUSTOM_LIVEKIT_TOKEN;
+  if (!url || !room || !token) return null;
+  return {
+    livekit_url: url,
+    livekit_room: room,
+    livekit_client_token: token
+  };
 }
 
 router.get("/avatars/public", async (req, res) => {
@@ -77,8 +107,11 @@ router.post("/new-session", async (req, res) => {
       voice_id: voiceId,
       context_id: contextId,
       language,
-      mode
+      mode,
+      livekit_config: livekitConfigOverride
     } = req.body || {};
+
+    const resolvedMode = mode || "FULL";
 
     if (!avatarId) {
       return res.status(400).json({
@@ -87,26 +120,32 @@ router.post("/new-session", async (req, res) => {
       });
     }
 
-    if (!voiceId || !contextId) {
+    if (resolvedMode === "FULL" && (!voiceId || !contextId)) {
       return res.status(400).json({
         ok: false,
         error: { message: "voice_id and context_id are required for FULL mode" }
       });
     }
 
-    const avatarPersona = {
-      voice_id: voiceId,
-      context_id: contextId
-    };
-    if (language) {
+    const avatarPersona = resolvedMode === "FULL" ? { voice_id: voiceId, context_id: contextId } : undefined;
+    if (avatarPersona && language) {
       avatarPersona.language = language;
     }
 
     const sessionTokenPayload = {
       avatar_id: avatarId,
-      mode: mode || "FULL",
-      avatar_persona: avatarPersona
+      mode: resolvedMode
     };
+    if (avatarPersona) {
+      sessionTokenPayload.avatar_persona = avatarPersona;
+    }
+
+    if (resolvedMode !== "FULL") {
+      const livekitConfig = livekitConfigOverride || getLivekitConfigFromEnv();
+      if (livekitConfig) {
+        sessionTokenPayload.livekit_config = livekitConfig;
+      }
+    }
 
     const tokenResult = await createLiveavatarSessionToken(apiKey, baseUrl, sessionTokenPayload);
     const sessionToken = tokenResult?.data?.session_token || tokenResult?.session_token;
@@ -122,10 +161,18 @@ router.post("/new-session", async (req, res) => {
     if (sessionId && sessionToken) {
       sessionTokens.set(sessionId, sessionToken);
     }
+    const wsUrl = extractWsUrl(startResult);
+    if (sessionId) {
+      sessionMeta.set(sessionId, {
+        mode: resolvedMode,
+        wsUrl
+      });
+    }
 
     const payload = {
       session_id: sessionId,
-      start: startResult
+      start: startResult,
+      ws_url: wsUrl
     };
 
     return res.json({ ok: true, data: payload });
@@ -157,7 +204,7 @@ router.post("/keepalive", async (req, res) => {
 router.post("/stop", async (req, res) => {
   try {
     const apiKey = process.env.LIVEAVATAR_API_KEY;
-    const { session_id: sessionId } = req.body || {};
+    const { session_id: sessionId, reason } = req.body || {};
 
     if (!sessionId) {
       return res.status(400).json({
@@ -169,9 +216,65 @@ router.post("/stop", async (req, res) => {
     const sessionToken = sessionTokens.get(sessionId);
     const data = await stopLiveavatarSession(apiKey, baseUrl, sessionId, sessionToken, reason);
     sessionTokens.delete(sessionId);
+    sessionMeta.delete(sessionId);
+    closeWs(sessionId);
     return res.json({ ok: true, data });
   } catch (error) {
     return handleError(res, error, "Failed to stop LiveAvatar session");
+  }
+});
+
+router.post("/speak", async (req, res) => {
+  try {
+    const { session_id: sessionId, text, tts_voice_id: voiceId } = req.body || {};
+
+    if (!sessionId) {
+      return res.status(400).json({
+        ok: false,
+        error: { message: "session_id is required" }
+      });
+    }
+
+    if (!text) {
+      return res.status(400).json({
+        ok: false,
+        error: { message: "text is required" }
+      });
+    }
+
+    const meta = sessionMeta.get(sessionId);
+    if (!meta?.wsUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: { message: "ws_url not found for session. Start in CUSTOM mode first." }
+      });
+    }
+
+    const ttsResult = await synthesizeSpeech({
+      text,
+      voiceId,
+      outputFormat: "pcm_s16le",
+      sampleRate: 24000
+    });
+
+    await sendAudioToLiveavatar(sessionId, meta.wsUrl, {
+      audioBase64: ttsResult.audioBase64,
+      sampleRate: ttsResult.sampleRate,
+      format: ttsResult.format
+    });
+
+    const shouldReturnAudio = process.env.CUSTOM_TTS_RETURN_AUDIO === "true";
+    return res.json({
+      ok: true,
+      data: {
+        session_id: sessionId,
+        audio_base64: shouldReturnAudio ? ttsResult.audioBase64 : undefined,
+        sample_rate_hz: shouldReturnAudio ? ttsResult.sampleRate : undefined,
+        audio_format: shouldReturnAudio ? ttsResult.format : undefined
+      }
+    });
+  } catch (error) {
+    return handleError(res, error, "Failed to send custom audio");
   }
 });
 
