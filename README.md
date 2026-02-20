@@ -59,6 +59,7 @@ npm run dev
 1) プリセット or カスタムアバター一覧を取得して Avatar ID を選択
 2) Mode を選択（FULL=LiveAvatar Voice / CUSTOM=Custom TTS）
 3) FULL の場合は Voice / Context を選択して「接続開始」
+   - カスタムアバターを選択し、Voice 一覧取得後は `default_voice`（private voice）が自動選択されます。
 4) LiveKit 接続情報が返ると自動で映像・音声を接続
 5) 音声認識でテキスト化 → /reply で GPT 応答 → LiveKit Data Channel（agent-control）で発話イベント送信
 6) keepalive は 30 秒間隔で自動送信（停止ボタンで停止）
@@ -70,7 +71,7 @@ CUSTOM モードでは、/liveavatar/speak 経由でカスタム TTS 音声を L
 
 - GET  `/liveavatar/avatars/public` : プリセットアバター一覧
 - GET  `/liveavatar/avatars/user` : カスタムアバター一覧
-- GET  `/liveavatar/voices` : Voice 一覧
+- GET  `/liveavatar/voices` : Voice 一覧（public/private）
 - GET  `/liveavatar/contexts` : Context 一覧
 - POST `/liveavatar/new-session` : avatar_id / voice_id / context_id を受け取り session_id と LiveKit 情報を返す
 - POST `/liveavatar/speak` : session_id / text / tts_voice_id を受け取りカスタム音声を送信

@@ -160,9 +160,15 @@ export async function listUserAvatars(apiKey, baseUrl) {
   return data;
 }
 
-export async function listVoices(apiKey, baseUrl) {
+export async function listVoices(apiKey, baseUrl, voiceType) {
   requireApiKey(apiKey);
-  const url = `${baseUrl}/voices`;
+  const query = new URLSearchParams();
+  if (voiceType) {
+    query.set("voice_type", voiceType);
+  }
+  query.set("page_size", "100");
+  const suffix = query.toString();
+  const url = suffix ? `${baseUrl}/voices?${suffix}` : `${baseUrl}/voices`;
   const res = await requestWithRetry(url, {
     method: "GET",
     headers: {

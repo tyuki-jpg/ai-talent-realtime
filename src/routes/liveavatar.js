@@ -28,6 +28,15 @@ function handleError(res, error, fallbackMessage) {
   });
 }
 
+function normalizeApiList(payload) {
+  const data = payload?.data;
+  if (Array.isArray(data?.results)) return data.results;
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(payload?.results)) return payload.results;
+  if (Array.isArray(payload?.items)) return payload.items;
+  return [];
+}
+
 function extractWsUrl(payload) {
   const candidates = [payload, payload?.data, payload?.start, payload?.start?.data];
   for (const candidate of candidates) {
@@ -80,9 +89,51 @@ router.get("/avatars/user", async (req, res) => {
 router.get("/voices", async (req, res) => {
   try {
     const apiKey = process.env.LIVEAVATAR_API_KEY;
-    const data = await listVoices(apiKey, baseUrl);
-    const voices = data?.data || data?.voices || data?.items || [];
-    return res.json({ ok: true, data: { voices, raw: data } });
+    const [publicResult, privateResult] = await Promise.allSettled([
+      listVoices(apiKey, baseUrl, "public"),
+      listVoices(apiKey, baseUrl, "private")
+    ]);
+
+    if (publicResult.status === "rejected" && privateResult.status === "rejected") {
+      throw publicResult.reason;
+    }
+
+    const publicVoices =
+      publicResult.status === "fulfilled"
+        ? normalizeApiList(publicResult.value).map((voice) => ({ ...voice, voice_type: "public" }))
+        : [];
+    const privateVoices =
+      privateResult.status === "fulfilled"
+        ? normalizeApiList(privateResult.value).map((voice) => ({ ...voice, voice_type: "private" }))
+        : [];
+
+    const seen = new Set();
+    const voices = [...privateVoices, ...publicVoices].filter((voice) => {
+      const id = voice?.voice_id || voice?.id;
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+
+    const warnings = [];
+    if (publicResult.status === "rejected") {
+      warnings.push({ source: "public", message: publicResult.reason?.message });
+    }
+    if (privateResult.status === "rejected") {
+      warnings.push({ source: "private", message: privateResult.reason?.message });
+    }
+
+    return res.json({
+      ok: true,
+      data: {
+        voices,
+        warnings,
+        raw: {
+          public: publicResult.status === "fulfilled" ? publicResult.value : null,
+          private: privateResult.status === "fulfilled" ? privateResult.value : null
+        }
+      }
+    });
   } catch (error) {
     return handleError(res, error, "Failed to list voices");
   }

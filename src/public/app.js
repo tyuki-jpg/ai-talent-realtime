@@ -10,7 +10,8 @@
   mode: "FULL",
   audioStatsTimer: null,
   audioContext: null,
-  avatarSpeaking: false
+  avatarSpeaking: false,
+  userAvatars: []
 };
 
 const els = {
@@ -157,6 +158,7 @@ async function handleFetchUserAvatars() {
     const response = await api("/liveavatar/avatars/user");
     const avatars = response?.data?.avatars || response?.data?.raw || response?.data;
     const list = normalizeList(avatars);
+    state.userAvatars = list;
     renderAvatars(els.userSelect, list, "Custom");
     log("カスタムアバター取得", { count: list.length });
     if (list.length === 0) {
@@ -172,8 +174,14 @@ async function handleFetchVoices() {
     const response = await api("/liveavatar/voices");
     const voices = response?.data?.voices || response?.data?.raw || response?.data;
     const list = normalizeList(voices);
-    renderSimpleSelect(els.voiceSelect, list, "name", "voice_id", "該当なし");
-    log("Voice取得", { count: list.length });
+    const decoratedList = list.map((voice) => ({
+      ...voice,
+      display_name: `[${voice?.voice_type || "public"}] ${voice?.name || "voice"}`
+    }));
+    renderSimpleSelect(els.voiceSelect, decoratedList, "display_name", "voice_id", "該当なし");
+    const privateCount = decoratedList.filter((voice) => voice.voice_type === "private").length;
+    log("Voice取得", { count: decoratedList.length, privateCount });
+    selectAvatarDefaultVoice();
   } catch (error) {
     log("Voice取得失敗", { message: error.message, detail: error.detail });
   }
@@ -200,6 +208,23 @@ function setConnectedUi(connected) {
   els.stopBtn.disabled = !connected;
 }
 
+function selectAvatarDefaultVoice(avatarId = els.avatarId.value.trim()) {
+  if (!avatarId || state.mode !== "FULL") return;
+
+  const avatar = state.userAvatars.find((item) => (item?.avatar_id || item?.id) === avatarId);
+  const defaultVoice = avatar?.default_voice;
+  if (!defaultVoice?.id) return;
+
+  const optionExists = Array.from(els.voiceSelect.options).some((option) => option.value === defaultVoice.id);
+  if (!optionExists) {
+    log("アバター既定Voiceが一覧に見つかりません", { avatarId, voiceId: defaultVoice.id });
+    return;
+  }
+
+  els.voiceSelect.value = defaultVoice.id;
+  log("アバター既定Voiceを自動選択", { avatarId, voiceId: defaultVoice.id, voiceName: defaultVoice.name });
+}
+
 function updateModeUi() {
   const mode = els.modeSelect?.value || "FULL";
   state.mode = mode;
@@ -209,6 +234,9 @@ function updateModeUi() {
   els.contextSelect.disabled = isCustom;
   els.fetchContextsBtn.disabled = isCustom;
   els.ttsVoiceId.disabled = !isCustom;
+  if (!isCustom) {
+    selectAvatarDefaultVoice();
+  }
 }
 
 function resetAvatarContainer() {
@@ -817,6 +845,7 @@ els.userSelect.addEventListener("change", () => {
   const value = els.userSelect.value;
   if (value) {
     els.avatarId.value = value;
+    selectAvatarDefaultVoice(value);
   }
 });
 els.personaBtn.addEventListener("click", handlePersonaChange);
